@@ -9,19 +9,37 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+
 #include "zcl/esp_zigbee_zcl_common.h"
+#include "esp_zigbee_core.h"
 
 #include "temp_sensor.h"
 
 /*------ Clobal definitions -----------*/
 bool time_updated = false, connected = false;
-uint16_t temperature = 0, humidity = 0, pressure = 0, CO2_value = 0;
+uint16_t pressure = 0, CO2_value = 0;
 static const char * TAG = "TEMP_SENSOR";
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
 	ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(mode_mask));
 }
+
+#define MAX_CHILDREN 10 /* the max amount of connected devices */
+#define INSTALLCODE_POLICY_ENABLE false /* enable the install code policy for security */
+#define SENSOR_ENDPOINT 1
+#define CO2_CUSTOM_CLUSTER 0xFFF2 /* Custom cluster used because standart cluster not working*/
+#define ESP_ZB_PRIMARY_CHANNEL_MASK \
+	ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK /* Zigbee primary channel mask use in the example */
+#define OTA_UPGRADE_MANUFACTURER \
+	0x1001 /* The attribute indicates the file version of the downloaded image on the device*/
+#define OTA_UPGRADE_IMAGE_TYPE \
+	0x1011 /* The attribute indicates the value for the manufacturer of the device */
+#define OTA_UPGRADE_FILE_VERSION \
+	0x01010101 /* The attribute indicates the file version of the running firmware image on the device */
+#define OTA_UPGRADE_HW_VERSION 0x0101 /* The parameter indicates the version of hardware */
+#define OTA_UPGRADE_MAX_DATA_SIZE \
+	64 /* The parameter indicates the maximum data size of query block image */
 
 /* Manual reporting atribute to coordinator */
 static void reportAttribute(
@@ -45,19 +63,24 @@ static void reportAttribute(
 }
 
 /* Task for update attribute value */
-void update_attribute()
+void update_attribute(void * q)
 {
-	while (1)
+	SensorData sensor_data;
+	QueueHandle_t queue = q;
+
+	while (true)
 	{
-		if (connected)
+		if (connected && xQueueReceive(queue, &sensor_data, 0) == pdPASS)
 		{
+			ESP_LOGI(TAG, "Got sensor data from the queue, sending..");
+
 			/* Write new temperature value */
 			esp_zb_zcl_status_t state_tmp = esp_zb_zcl_set_attribute_val(
 				SENSOR_ENDPOINT,
 				ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
 				ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
 				ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-				&temperature,
+				&sensor_data.temperature,
 				false);
 
 			/* Check for error */
@@ -72,7 +95,7 @@ void update_attribute()
 				ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
 				ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
 				ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
-				&humidity,
+				&sensor_data.humidity,
 				false);
 
 			/* Check for error */
@@ -82,18 +105,21 @@ void update_attribute()
 			}
 
 			/* Write new pressure value */
-			esp_zb_zcl_status_t state_press = esp_zb_zcl_set_attribute_val(
-				SENSOR_ENDPOINT,
-				ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
-				ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-				ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID,
-				&pressure,
-				false);
-
-			/* Check for error */
-			if (state_press != ESP_ZB_ZCL_STATUS_SUCCESS)
+			if (pressure != 0)
 			{
-				ESP_LOGE(TAG, "Setting pressure attribute failed!");
+				esp_zb_zcl_status_t state_press = esp_zb_zcl_set_attribute_val(
+					SENSOR_ENDPOINT,
+					ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
+					ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+					ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID,
+					&pressure,
+					false);
+
+				/* Check for error */
+				if (state_press != ESP_ZB_ZCL_STATUS_SUCCESS)
+				{
+					ESP_LOGE(TAG, "Setting pressure attribute failed!");
+				}
 			}
 
 			if (CO2_value != 0)
@@ -117,7 +143,7 @@ void update_attribute()
 				reportAttribute(SENSOR_ENDPOINT, CO2_CUSTOM_CLUSTER, 0, &CO2_value, 2);
 			}
 		}
-		vTaskDelay(5000 / portTICK_PERIOD_MS);
+		vTaskDelay(100 / portTICK_PERIOD_MS);
 	}
 }
 
@@ -302,6 +328,15 @@ static void set_zcl_string(char * buffer, char * value)
 	memcpy(buffer + 1, value, buffer[0]);
 }
 
+#define ESP_ZB_ZR_CONFIG() \
+	{ \
+		.esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER, \
+		.install_code_policy = INSTALLCODE_POLICY_ENABLE, \
+		.nwk_cfg.zczr_cfg = { \
+			.max_children = MAX_CHILDREN, \
+		}, \
+	}
+
 static void esp_zb_task(void * pvParameters)
 {
 	static char manufacturer[16], model[16], firmware_version[16];
@@ -460,8 +495,21 @@ static void esp_zb_task(void * pvParameters)
 	esp_zb_main_loop_iteration();
 }
 
+#define ESP_ZB_DEFAULT_RADIO_CONFIG() \
+	{ \
+		.radio_mode = RADIO_MODE_NATIVE, \
+	}
+
+#define ESP_ZB_DEFAULT_HOST_CONFIG() \
+	{ \
+		.host_connection_mode = HOST_CONNECTION_MODE_NONE, \
+	}
+
 void app_main(void)
 {
+	QueueHandle_t queue = xQueueCreate(1, sizeof(SensorData));
+	I2C_conf conf;
+
 	esp_zb_platform_config_t config = {
 		.radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
 		.host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
@@ -469,7 +517,10 @@ void app_main(void)
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
-	xTaskCreate(sensor_reader_task, "sensor_task", 4096, init_aht10(), 1, NULL);
-	xTaskCreate(update_attribute, "update_attr", 4096, NULL, 5, NULL);
+	conf.handle = init_sensor();
+	conf.queue = queue;
+
+	xTaskCreate(sensor_reader_task, "sensor_task", 4096, &conf, 1, NULL);
+	xTaskCreate(update_attribute, "update_attr", 4096, queue, 5, NULL);
 	xTaskCreate(esp_zb_task, "zigbee_main", 4096, NULL, 6, NULL);
 }
