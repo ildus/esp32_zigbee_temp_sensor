@@ -84,24 +84,26 @@ static void set_normal_mode(i2c_master_dev_handle_t dev_handle)
 
 uint16_t decode_temp(uint8_t * payload)
 {
-	uint32_t temperature = ((uint32_t)(payload[3] & 0x0F) << 16) | ((uint16_t)payload[4] << 8)
+	uint32_t tdata = ((uint32_t)(payload[3] & 0x0F) << 16) | ((uint16_t)payload[4] << 8)
 		| payload[5]; //20-bit raw temperature data
 
-	return (uint16_t)((float)temperature * 0.000191 - 50);
+    float temp = ((float)tdata * 200 / 0x100000) - 50;
+
+	return (uint16_t) (temp * 100);
 }
 
 uint16_t decode_humidity(uint8_t * payload)
 {
-	uint32_t rawData = (((uint32_t)payload[1] << 16) | ((uint16_t)payload[2] << 8) | (payload[3]))
+	uint32_t hdata = (((uint32_t)payload[1] << 16) | ((uint16_t)payload[2] << 8) | (payload[3]))
 		>> 4; //20-bit raw humidity data
-	float humidity = (float)rawData * 0.000095;
+	float humidity = ((float)hdata * 100) / 0x100000;
 
 	if (humidity < 0)
 		return 0;
 	if (humidity > 100)
 		return 100;
 
-	return (uint16_t)humidity;
+	return (uint16_t) (humidity * 100);
 }
 
 static bool read_sensor_data(i2c_master_dev_handle_t dev_handle, SensorData * result)
@@ -114,7 +116,7 @@ static bool read_sensor_data(i2c_master_dev_handle_t dev_handle, SensorData * re
 		return false;
 	}
 
-	uint8_t status = read_status_byte(dev_handle); //force to read status byte
+	uint8_t status = read_status_byte(dev_handle);
 	if (status == AHT10_ERROR)
 	{
 		ESP_LOGI(TAG, "i2c returned error status");
@@ -252,7 +254,7 @@ void sensor_reader_task(void * c)
 	{
 		if (read_sensor_data(dev_handle, &result))
         {
-			xQueueSend(queue, (void *)&result, 100 / portTICK_PERIOD_MS);
+			xQueueOverwrite(queue, (void *)&result);
 			ESP_LOGI(TAG, "Sent sensor data to the queue");
         }
 
